@@ -4,6 +4,10 @@
 # Budapest time: 03:23:15
 #
 
+# Version: Ver.1 (PAN logging aligned with RND Velocity)
+# Local time: 2026-10-12 19:56:17 +0000
+# Modification: Align debug logging format and randomizer status summaries with RND Velocity.
+
 import json
 from html import escape as html_escape
 import math
@@ -20,7 +24,7 @@ from zoneinfo import ZoneInfo
 import jack
 
 from PySide6.QtCore import Qt, QSize, QPointF, QTimer, Signal, QEvent
-from PySide6.QtGui import QAction, QActionGroup, QContextMenuEvent, QIcon, QPixmap, QPalette, QColor, QFont, QFontMetrics, QTextCursor, QPainter, QPen
+from PySide6.QtGui import QAction, QActionGroup, QContextMenuEvent, QIcon, QPixmap, QPalette, QColor, QFont, QFontMetrics, QTextCursor, QTextCharFormat, QTextFormat, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -48,6 +52,7 @@ from PySide6.QtWidgets import (
     QWidget,
     QComboBox,
     QPlainTextEdit,
+    QTextEdit,
     QColorDialog,
     QRadioButton,
     QSlider,
@@ -473,26 +478,6 @@ class JackMidiBackend:
         self.midi_in = None
         self.midi_out = None
 
-        # MIDI is always passed through unchanged.
-        self.recommended_activity_filter = {
-            "Note On": True,
-            "Note Off": True,
-            "Control Change (CC)": True,
-            "Program Change": True,
-            "Aftertouch / Channel Pressure": True,
-            "Polyphonic Aftertouch": True,
-            "System Exclusive (SysEx)": True,
-            "MIDI Clock": False,
-            "Start": True,
-            "Continue": False,
-            "Stop": True,
-            "Active Sensing": False,
-            "System Reset": False,
-            "Time Code / MTC": False,
-        }
-        self.activity_filter = dict(
-            self.recommended_activity_filter
-        )
         self._activity_counts = [0] * CHANNEL_COUNT
 
     def start(self):
@@ -521,17 +506,27 @@ class JackMidiBackend:
         )
 
     def debug_log(self, message):
+        # Keep every backend message on one physical line and route it to the GUI.
+        message = " | ".join(str(message).splitlines()).strip()
+        callback = getattr(self, "log_callback", None)
+        if callback is not None:
+            try:
+                callback(message)
+            except Exception:
+                pass
         if self.debug_to_terminal:
             timestamp = datetime.now(
                 ZoneInfo("Europe/Budapest")
             ).strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[{timestamp}] {message}")
+            print(f"[{timestamp}] {message}", flush=True)
 
     def set_debug_to_terminal(self, enabled):
+        # Terminal output is optional; GUI logging remains enabled.
         self.debug_to_terminal = bool(enabled)
+        self.debug_event_logging = True
 
     def process(self, frames):
-        """Filter MIDI events, forward allowed events unchanged, and count them."""
+        """Forward MIDI events unchanged and count channel-voice activity."""
         if self.midi_in is None or self.midi_out is None:
             return
 
@@ -539,60 +534,11 @@ class JackMidiBackend:
 
         for offset, event in self.midi_in.incoming_midi_events():
             event_bytes = bytes(event)
+            self.midi_out.write_midi_event(offset, event_bytes)
 
-            # The Activity Filter is the real MIDI forwarding filter.
-            # Checked types are forwarded unchanged; unchecked types
-            # are blocked before MIDI OUT.
-            # Activity filters affect only the indicators/UI. Never block
-            # MIDI forwarding here (especially Note Off and transport events).
-            self.midi_out.write_midi_event(
-                offset,
-                event_bytes,
-            )
-
-            # The indicators react only to MIDI that passed the filter.
-            # Channel Voice messages carry a zero-based MIDI channel in
-            # the low nibble of the status byte.
-            if self.filter_allows_event(event_bytes) and 0x80 <= event_bytes[0] <= 0xEF:
+            if event_bytes and 0x80 <= event_bytes[0] <= 0xEF:
                 channel = event_bytes[0] & 0x0F
                 self._activity_counts[channel] += 1
-
-    def classify_midi_event(self, event):
-        data = bytes(event)
-        if not data:
-            return None
-
-        status = data[0]
-
-        if 0x80 <= status <= 0xEF:
-            return {
-                0x80: "Note Off",
-                0x90: "Note On",
-                0xA0: "Polyphonic Aftertouch",
-                0xB0: "Control Change (CC)",
-                0xC0: "Program Change",
-                0xD0: "Aftertouch / Channel Pressure",
-                }.get(status & 0xF0)
-
-        return {
-            0xF0: "System Exclusive (SysEx)",
-            0xF1: "Time Code / MTC",
-            0xF2: "Time Code / MTC",
-            0xF3: "Time Code / MTC",
-            0xF8: "MIDI Clock",
-            0xFA: "Start",
-            0xFB: "Continue",
-            0xFC: "Stop",
-            0xFE: "Active Sensing",
-            0xFF: "System Reset",
-        }.get(status)
-
-    def filter_allows_event(self, event):
-        category = self.classify_midi_event(event)
-        return (
-            category is not None
-            and self.activity_filter.get(category, False)
-        )
 
     def take_channel_activity(self):
         counts = self._activity_counts[:]
@@ -782,13 +728,20 @@ class RndPanBackend(JackMidiBackend):
         return values
 
     def _log_note_value(self, message):
-        # JACK callbacks must not perform file I/O or update Qt widgets.
-        # Queue the message for the GUI thread; terminal/file output happens there.
+        # Keep event logging independent from optional terminal output.
+        # The callback only queues the message; the Qt timer displays it.
+        if not getattr(self, "debug_event_logging", True):
+            return
         callback = getattr(self, "log_callback", None)
-        if callback is not None and self.debug_event_logging:
-            callback(message)
-        elif self.debug_to_terminal:
-            timestamp = datetime.now(ZoneInfo("Europe/Budapest")).strftime("%H:%M:%S.%f")[:-3]
+        if callback is not None:
+            try:
+                callback(message)
+            except Exception:
+                pass
+        if self.debug_to_terminal:
+            timestamp = datetime.now(
+                ZoneInfo("Europe/Budapest")
+            ).strftime("%H:%M:%S.%f")[:-3]
             print(f"[{timestamp}] {message}", flush=True)
 
     def process(self, frames):
@@ -802,7 +755,7 @@ class RndPanBackend(JackMidiBackend):
             if not event_bytes:
                 continue
 
-            # Display/activity filters must never suppress outgoing MIDI.
+            # MIDI activity is counted without a message-type filter.
             status = event_bytes[0]
             channel = status & 0x0F
 
@@ -815,7 +768,7 @@ class RndPanBackend(JackMidiBackend):
             ):
                 self.current_pan[channel] = event_bytes[2]
                 self.midi_out.write_midi_event(offset, event_bytes)
-                if self.filter_allows_event(event_bytes) and 0x80 <= status <= 0xEF:
+                if 0x80 <= status <= 0xEF:
                     self._activity_counts[channel] += 1
                 continue
 
@@ -848,17 +801,20 @@ class RndPanBackend(JackMidiBackend):
                 self.current_pan[channel] = outgoing_pan
                 self._generated_values.put(outgoing_pan)
 
+                minimum = getattr(randomizer, "minimum", "?")
+                maximum = getattr(randomizer, "maximum", "?")
                 self._log_note_value(
-                    f"CH {channel + 1}  {midi_note_name(note)}  PAN {incoming_pan} → {outgoing_pan}"
+                    f"RND PAN | {midi_note_name(note)} | "
+                    f"Pan: {incoming_pan} → {outgoing_pan} | "
+                    f"Range: {minimum}–{maximum}"
                 )
 
-                if self.filter_allows_event(event_bytes):
-                    self._activity_counts[channel] += 1
+                self._activity_counts[channel] += 1
                 continue
 
             self.midi_out.write_midi_event(offset, event_bytes)
 
-            if self.filter_allows_event(event_bytes) and 0x80 <= status <= 0xEF:
+            if 0x80 <= status <= 0xEF:
                 self._activity_counts[channel] += 1
 
 
@@ -1450,198 +1406,6 @@ class WindowSizePage(QWidget):
 
     def resizable(self):
         return self.resize_checkbox.isChecked()
-
-
-class MidiFilterPage(QWidget):
-    """MIDI message activity filter settings page."""
-
-    TOOLTIP_TEXTS = {
-        "Note On": "Allows MIDI Note On messages to pass through the filter.",
-        "Note Off": "Allows MIDI Note Off messages to pass through the filter.",
-        "Control Change (CC)": "Allows MIDI Control Change (CC) messages to pass through the filter.",
-        "Program Change": "Allows MIDI Program Change messages to pass through the filter.",
-        "Aftertouch / Channel Pressure": "Allows Channel Pressure (Aftertouch) messages to pass through the filter.",
-        "Polyphonic Aftertouch": "Allows Polyphonic Aftertouch messages to pass through the filter.",
-        "System Exclusive (SysEx)": "Allows System Exclusive (SysEx) messages to pass through the filter.",
-        "MIDI Clock": (
-            "Triggers the indicator for MIDI Clock timing messages. "
-            "Disabled by default because Clock can arrive continuously."
-        ),
-        "Start": "Allows MIDI Start messages to pass through the filter.",
-        "Continue": "Allows MIDI Continue messages to pass through the filter.",
-        "Stop": "Allows MIDI Stop messages to pass through the filter.",
-        "Active Sensing": (
-            "Triggers the indicator for MIDI Active Sensing messages. "
-            "Disabled by default because these may arrive continuously."
-        ),
-        "System Reset": "Allows MIDI System Reset messages to pass through the filter.",
-        "Time Code / MTC": "Allows MIDI Time Code / MTC System Common messages to pass through the filter.",
-    }
-
-    def __init__(self, backend, parent=None):
-        super().__init__(parent)
-        self.backend = backend
-        self.checks = {}
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 4, 8, 4)
-        layout.setSpacing(7)
-
-        title = QLabel("MIDI Filter")
-        title.setStyleSheet(
-            "font-size: 18px; font-weight: bold;"
-        )
-
-        description = QLabel(
-            "Choose which MIDI message types should trigger the activity "
-            "indicator. This filter affects only the indication: every MIDI "
-            "message is still passed through unchanged."
-        )
-        description.setWordWrap(True)
-        description.setStyleSheet(
-            "color: #000000; font-size: 12px;"
-        )
-
-        layout.addWidget(title)
-        layout.addWidget(description)
-        layout.addSpacing(5)
-
-        # Only the approved message types are presented in Preferences.
-        # Legacy system-message entries are hidden from this page.
-        columns = QHBoxLayout()
-        columns.setContentsMargins(0, 0, 0, 0)
-        columns.setSpacing(24)
-
-        left_column = QVBoxLayout()
-        left_column.setContentsMargins(0, 0, 0, 0)
-        left_column.setSpacing(7)
-
-        right_column = QVBoxLayout()
-        right_column.setContentsMargins(0, 0, 0, 0)
-        right_column.setSpacing(7)
-
-        categories = [
-            "Note On",
-            "Note Off",
-            "Control Change (CC)",
-            "Program Change",
-            "Aftertouch / Channel Pressure",
-            "Polyphonic Aftertouch",
-            "MIDI Clock",
-        ]
-        split_index = 4
-
-        for column, column_categories in (
-            (left_column, categories[:split_index]),
-            (right_column, categories[split_index:]),
-        ):
-            for category in column_categories:
-                check = QCheckBox(category)
-                check.setChecked(
-                    self.backend.activity_filter[category]
-                )
-                # QCheckBox tooltip covers both the box and its label.
-                check.setToolTip(
-                    self.TOOLTIP_TEXTS.get(
-                        category,
-                        "Controls whether this MIDI message type is allowed through the MIDI filter.",
-                    )
-                )
-                check.toggled.connect(
-                    lambda checked, name=category:
-                    self.set_filter_value(name, checked)
-                )
-                column.addWidget(check)
-                self.checks[category] = check
-
-            column.addStretch()
-
-        columns.addLayout(left_column)
-        columns.addLayout(right_column)
-        layout.addLayout(columns)
-
-        quick_actions = QHBoxLayout()
-        select_all = QPushButton("Select All")
-        clear_all = QPushButton("Clear All")
-        reset_recommended = QPushButton("Reset to Recommended")
-
-        select_all.setToolTip(
-            "Enable all MIDI message types for activity indication."
-        )
-        clear_all.setToolTip(
-            "Disable all MIDI message types for activity indication."
-        )
-        reset_recommended.setToolTip(
-            "Restore the recommended Activity Filter settings."
-        )
-
-        select_all.clicked.connect(
-            lambda: [
-                check.setChecked(True)
-                for check in self.checks.values()
-            ]
-        )
-        clear_all.clicked.connect(
-            lambda: [
-                check.setChecked(False)
-                for check in self.checks.values()
-            ]
-        )
-        reset_recommended.clicked.connect(
-            self.reset_recommended
-        )
-
-        quick_actions.addWidget(select_all)
-        quick_actions.addWidget(clear_all)
-        quick_actions.addWidget(reset_recommended)
-        quick_actions.addStretch()
-        help_button = QPushButton("?")
-        help_button.setMaximumWidth(28)
-        help_button.clicked.connect(self.show_local_help)
-        help_button.setToolTip("Local help")
-        quick_actions.addWidget(help_button)
-        layout.addLayout(quick_actions)
-        layout.addStretch()
-
-    def show_local_help(self):
-        QMessageBox.information(
-            self,
-            "MIDI Filter Help",
-            "MIDI Filter\n\n"
-            "The selected MIDI message types trigger the MIDI activity "
-            "indicator. Message forwarding is independent of this filter "
-            "and remains unchanged.\n\n"
-            "Reset to Recommended restores the recommended filter settings."
-        )
-
-    def reset_recommended(self):
-        answer = QMessageBox.question(
-            self,
-            "Reset to Recommended",
-            "Reset all MIDI Filter settings to the recommended values?",
-            QMessageBox.StandardButton.Yes
-            | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-
-        for category, check in self.checks.items():
-            check.setChecked(
-                self.backend.recommended_activity_filter.get(
-                    category,
-                    False,
-                )
-            )
-
-    def set_filter_value(self, category, enabled):
-        """Apply one filter change immediately to the live backend."""
-        self.backend.activity_filter[category] = bool(enabled)
-
-    def sync_filter(self):
-        """Synchronize visible checkbox values with the live backend."""
-        for category, check in self.checks.items():
-            self.backend.activity_filter[category] = check.isChecked()
 
 
 class MidiMonitorDialog(QDialog):
@@ -3455,7 +3219,8 @@ class PreferencesDialog(QDialog):
         self.setWindowTitle(
             "MIDI Randomize Preferences"
         )
-        self.setModal(True)
+        # Preferences is modeless so the main window remains usable.
+        self.setWindowModality(Qt.WindowModality.NonModal)
         self.resize(700, 633)
         self.setMinimumSize(620, 531)
 
@@ -3517,14 +3282,6 @@ class PreferencesDialog(QDialog):
                 ),
                 "view-grid",
                 QStyle.StandardPixmap.SP_FileDialogDetailedView,
-            ),
-            (
-                "MIDI Filter",
-                lambda: MidiFilterPage(
-                    self.backend,
-                ),
-                "view-filter",
-                QStyle.StandardPixmap.SP_FileDialogContentsView,
             ),
             (
                 "Randomizer",
@@ -3650,8 +3407,6 @@ class PreferencesDialog(QDialog):
                 self.output_page = built_page
             elif label == "Layouts":
                 self.layouts_page = built_page
-            elif label == "MIDI Filter":
-                self.filter_page = built_page
             elif label == "Randomizer":
                 self.randomizer_page = built_page
             elif label == "Randomizer Behavior":
@@ -3833,7 +3588,6 @@ class PreferencesDialog(QDialog):
             self.selected_rnd_value_size,
         ) = self.display_page.values()
 
-        self.filter_page.sync_filter()
         self.refresh_timer.stop()
         self.accept()
 
@@ -6145,8 +5899,6 @@ class MidiRandomizeWindow(QMainWindow):
             self.backend.set_debug_to_terminal(
                 self.debug_to_terminal
             )
-        if hasattr(self.backend, "set_debug_to_terminal"):
-            self.backend.set_debug_to_terminal(self.debug_to_terminal)
         self.backend.log_callback = self._queue_backend_debug_message
         self.backend.debug_event_logging = True
         if backend is None:
@@ -6394,7 +6146,7 @@ class MidiRandomizeWindow(QMainWindow):
             wrapped_tooltip(
                 "Preferences\n"
                 "Opens the full settings panel: MIDI Input/Output, "
-                "Layouts, MIDI Filter, Randomizer, Randomization Behavior "
+                "Layouts, Randomizer, Randomization Behavior "
                 "and Display."
             )
         )
@@ -6534,6 +6286,7 @@ class MidiRandomizeWindow(QMainWindow):
 
         saved_width = self.window_width
         self.set_window_width(saved_width)
+        QTimer.singleShot(0, self.restore_saved_window_geometry)
 
         QTimer.singleShot(
             0,
@@ -6607,6 +6360,12 @@ class MidiRandomizeWindow(QMainWindow):
                 control.set_compact_labels(compact)
             else:
                 control.set_caption(caption)
+                if attribute == "main_change_knob":
+                    control._formatter = (
+                        (lambda value: ("Unlim." if compact else "Unlimited")
+                         if value >= MIDI_MAX else f"±{value}")
+                    )
+                    control.set_value(control.value())
         if hasattr(self, "preset_label"):
             self.preset_label.setText("" if compact else "Preset:")
 
@@ -7044,7 +6803,9 @@ class MidiRandomizeWindow(QMainWindow):
                 self.style().standardIcon(QStyle.StandardPixmap.SP_MediaStop)
             )
             self._sync_output_status_in_preferences(True)
-            self.debug_log("RND PAN: ACTIVATED")
+            self.debug_log(
+                f"RND PAN: ACTIVATED | {self._randomizer_status_summary()}"
+            )
         else:
             self.stop_randomizer()
 
@@ -7144,8 +6905,36 @@ class MidiRandomizeWindow(QMainWindow):
         }.get(element)
         if attribute is None:
             return
+
+        # Preserve the current width, but let the main window recompute its
+        # height when a Layouts element is shown or hidden.
+        current_width = self.width()
+        was_resizable = self.window_resizable
+
         setattr(self, attribute, bool(visible))
         self.apply_main_element_visibility()
+
+        central = self.centralWidget()
+        central_layout = central.layout() if central is not None else None
+        if central_layout is not None:
+            central_layout.activate()
+
+        # Temporarily remove fixed-size constraints so hidden content can
+        # actually reduce the top-level window height.
+        self.setMinimumSize(QSize(1, 1))
+        self.setMaximumSize(QSize(MAX_SIZE, MAX_SIZE))
+        self.adjustSize()
+        self.resize(current_width, self.height())
+
+        if was_resizable:
+            min_width, min_height = self.layout_minimum_dimensions()
+            self.setMinimumSize(QSize(min_width, min_height))
+            self.setMaximumSize(QSize(MAX_SIZE, MAX_SIZE))
+        else:
+            self.setMinimumSize(self.size())
+            self.setMaximumSize(self.size())
+
+        self.window_size = max(self.width(), self.height())
         self.save_preferences(self.window_size, self.window_resizable)
 
     def load_layout(self):
@@ -7735,22 +7524,16 @@ class MidiRandomizeWindow(QMainWindow):
             self.debug_log(message)
 
     def debug_log(self, message):
+        """Append one single-line timestamped message to GUI and terminal logs."""
         message = " | ".join(str(message).splitlines()).strip()
-        timestamp = datetime.now(ZoneInfo("Europe/Budapest")).strftime("%H:%M:%S")
+        timestamp = datetime.now(
+            ZoneInfo("Europe/Budapest")
+        ).strftime("%H:%M:%S")
         line = f"[{timestamp}] {message}"
-        self._debug_messages.append(line)
-        self._debug_messages = self._debug_messages[-200:]
-        panel = getattr(self, "debug_panel", None)
-        if panel is not None:
-            panel.appendPlainText(line)
+        self._append_debug_message(line)
         if self.debug_to_terminal:
             print(line, flush=True)
-        if getattr(self, "open_terminal_for_debug", False):
-            try:
-                with self._debug_log_file.open("a", encoding="utf-8") as stream:
-                    stream.write(line + "\n")
-            except OSError:
-                pass
+
 
     def load_open_terminal_for_debug(self):
         try:
@@ -7775,18 +7558,42 @@ class MidiRandomizeWindow(QMainWindow):
         self.save_preferences(self.window_size, self.window_resizable)
 
     def set_debug_panel_rows(self, rows):
+        old_height = (
+            self.fontMetrics().lineSpacing() * self.debug_panel_rows + 12
+        )
         self.debug_panel_rows = max(2, min(10, int(rows)))
+        new_height = (
+            self.fontMetrics().lineSpacing() * self.debug_panel_rows + 12
+        )
         panel = getattr(self, "debug_panel", None)
         if panel is not None:
-            panel.setFixedHeight(self.fontMetrics().lineSpacing() * self.debug_panel_rows + 12)
+            panel.setFixedHeight(new_height)
+            if self.debug_panel_toggle.isChecked():
+                self._resize_window_for_debug_panel(new_height - old_height)
         self.save_preferences(self.window_size, self.window_resizable)
+
+    def _resize_window_for_debug_panel(self, height_delta):
+        """Grow/shrink the window by the visible debug panel's exact height."""
+        if not height_delta:
+            return
+        current_height = self.height()
+        target_height = max(1, current_height + int(height_delta))
+        self.resize(self.width(), target_height)
+        if self.window_resizable:
+            self.window_size = max(self.width(), self.height())
 
     def toggle_debug_panel(self, expanded):
         panel = getattr(self, "debug_panel", None)
         if panel is None:
             return
-        panel.setVisible(bool(expanded))
+        panel_height = panel.height()
+        self.debug_panel.setVisible(bool(expanded))
         self.debug_panel_toggle.setText("Log  ▴" if expanded else "Log  ▾")
+        # Account for the layout's gap between the control row and the panel.
+        spacing = 6
+        self._resize_window_for_debug_panel(
+            panel_height + spacing if expanded else -(panel_height + spacing)
+        )
 
     def open_debug_terminal(self):
         process = getattr(self, "_debug_terminal_process", None)
@@ -7807,10 +7614,96 @@ class MidiRandomizeWindow(QMainWindow):
             self._append_debug_message(f"ERROR: could not open debug terminal: {exc}")
 
     def _append_debug_message(self, line):
-        self._debug_messages.append(str(line))
+        line = str(line)
+        self._debug_messages.append(line)
         self._debug_messages = self._debug_messages[-200:]
-        if getattr(self, "debug_panel", None) is not None:
-            self.debug_panel.appendPlainText(str(line))
+        panel = getattr(self, "debug_panel", None)
+        if panel is not None:
+            panel.appendPlainText(line)
+            document = panel.document()
+            while document.blockCount() > 200:
+                cursor = panel.textCursor()
+                cursor.movePosition(cursor.MoveOperation.Start)
+                cursor.select(cursor.SelectionType.BlockUnderCursor)
+                cursor.removeSelectedText()
+                cursor.deleteChar()
+            cursor = panel.textCursor()
+            cursor.movePosition(cursor.MoveOperation.End)
+            panel.setTextCursor(cursor)
+            panel.ensureCursorVisible()
+            self._update_debug_panel_current_line()
+        if getattr(self, "open_terminal_for_debug", False):
+            try:
+                with self._debug_log_file.open("a", encoding="utf-8") as stream:
+                    stream.write(line + "\n")
+            except OSError:
+                pass
+
+
+    def _update_debug_panel_current_line(self):
+        """Invert the colors of the newest log line for clear visual focus."""
+        panel = getattr(self, "debug_panel", None)
+        if panel is None:
+            return
+        background = QColor(self.window_text_background_color)
+        foreground = QColor(self.window_text_color)
+        if not background.isValid():
+            background = QColor("#ffffff")
+        if not foreground.isValid():
+            foreground = QColor("#000000")
+
+        selection = QTextEdit.ExtraSelection()
+        # appendPlainText() may leave an empty trailing block after the
+        # visible message. Highlight the last non-empty block, not that block.
+        block = panel.document().lastBlock()
+        if not block.text() and block.previous().isValid():
+            block = block.previous()
+        cursor = QTextCursor(panel.document())
+        cursor.setPosition(block.position())
+        cursor.movePosition(
+            QTextCursor.MoveOperation.EndOfBlock,
+            QTextCursor.MoveMode.KeepAnchor,
+        )
+        selection.cursor = cursor
+        selection.format = QTextCharFormat()
+        selection.format.setBackground(foreground)
+        selection.format.setForeground(background)
+        selection.format.setProperty(
+            QTextFormat.Property.FullWidthSelection,
+            True,
+        )
+        panel.setExtraSelections([selection])
+
+    def _randomizer_status_summary(self):
+        """Return current PAN randomizer settings for status log lines."""
+        minimum = getattr(randomizer, "minimum", "?")
+        maximum = getattr(randomizer, "maximum", "?")
+        bias = getattr(randomizer, "bias", "?")
+        max_change = getattr(randomizer, "max_change", "?")
+        distribution = getattr(randomizer, "distribution", "?")
+        last_value = getattr(self, "midi_pan", None)
+        interval_shift = "?"
+        width = "?"
+        for attr, target in (
+            ("main_interval_knob", "shift"),
+            ("main_width_knob", "width"),
+        ):
+            knob = getattr(self, attr, None)
+            if knob is not None:
+                try:
+                    number = int(knob.value())
+                except Exception:
+                    number = "?"
+                if target == "shift":
+                    interval_shift = number
+                else:
+                    width = number
+        last_text = "—" if last_value is None else str(last_value)
+        return (
+            f"range={minimum}-{maximum} bias={bias} max_change={max_change} "
+            f"interval_shift={interval_shift} width={width} "
+            f"distribution={distribution} last_pan={last_text}"
+        )
 
     def add_randomizer_value(self, value):
         """Append one generated randomizer value to the live main-window graph."""
@@ -8125,17 +8018,10 @@ class MidiRandomizeWindow(QMainWindow):
                 widget.update_active_status()
 
     def poll_midi_activity(self):
-        counts = self.backend.take_channel_activity()
-
-        # The main window is now the randomizer graph, not the former
-        # 16-channel indicator grid. Keep the existing activity polling for
-        # diagnostics/debug logging, but do not address removed channel widgets.
-        for channel, count in enumerate(counts):
-            if count > 0:
-                self.debug_log(
-                    f"RND PAN | MIDI activity: CH {channel + 1} "
-                    f"({count} event(s))"
-                )
+        # Drain the activity counters, but do not emit generic MIDI activity
+        # lines. Randomized Note On events are logged by the backend with
+        # note name, incoming/outgoing PAN values, and the configured range.
+        self.backend.take_channel_activity()
 
     def clear_midi_activity(self):
         pass
@@ -8768,6 +8654,17 @@ class MidiRandomizeWindow(QMainWindow):
                 minimum, maximum = maximum, minimum
 
             randomizer.set_range(minimum, maximum)
+            runtime_minimum = max(
+                MIDI_MIN,
+                min(MIDI_MAX, int(data.get("randomizer_runtime_minimum", minimum))),
+            )
+            runtime_maximum = max(
+                MIDI_MIN,
+                min(MIDI_MAX, int(data.get("randomizer_runtime_maximum", maximum))),
+            )
+            if runtime_minimum > runtime_maximum:
+                runtime_minimum, runtime_maximum = runtime_maximum, runtime_minimum
+            randomizer.set_runtime_range(runtime_minimum, runtime_maximum)
 
             distribution = data.get(
                 "randomizer_distribution",
@@ -8837,6 +8734,9 @@ class MidiRandomizeWindow(QMainWindow):
                         "show_interval": bool(self.show_interval),
                         "start_in_play": bool(self.start_in_play),
                         "window_width": int(self.width()),
+                        "window_height": int(self.height()),
+                        "window_x": int(self.x()),
+                        "window_y": int(self.y()),
                         "background_color": self.background_color,
                         "color_collection": self.color_collection,
                         "button_background_color": self.button_background_color,
@@ -8879,6 +8779,8 @@ class MidiRandomizeWindow(QMainWindow):
                         ),
                         "randomizer_minimum": int(randomizer.minimum),
                         "randomizer_maximum": int(randomizer.maximum),
+                        "randomizer_runtime_minimum": int(randomizer.runtime_range[0]),
+                        "randomizer_runtime_maximum": int(randomizer.runtime_range[1]),
                         "randomizer_distribution": randomizer.distribution,
                         "randomizer_bias": int(randomizer.bias),
                         "randomizer_max_change": int(randomizer.max_change),
@@ -8907,6 +8809,29 @@ class MidiRandomizeWindow(QMainWindow):
                 "Preferences save failed: "
                 f"{exc}"
             )
+
+    def restore_saved_window_geometry(self):
+        """Restore the last saved window dimensions and position when available."""
+        if not PREFERENCES_FILE.exists():
+            return
+        try:
+            data = json.loads(PREFERENCES_FILE.read_text(encoding="utf-8"))
+            width = int(data.get("window_width", self.width()))
+            height = int(data.get("window_height", self.height()))
+            x = int(data.get("window_x", self.x()))
+            y = int(data.get("window_y", self.y()))
+        except (OSError, ValueError, TypeError):
+            return
+
+        width = max(120, min(MAX_SIZE, width))
+        height = max(120, min(MAX_SIZE, height))
+        width, height = self.fit_geometry_to_screen(width, height)
+
+        # Release any fixed-size constraints before restoring the geometry.
+        self.setMinimumSize(1, 1)
+        self.setMaximumSize(MAX_SIZE, MAX_SIZE)
+        self.setGeometry(x, y, width, height)
+        self.keep_window_on_screen()
 
     def keep_window_on_screen(self):
         screen = self.screen()
@@ -9108,21 +9033,19 @@ class MidiRandomizeWindow(QMainWindow):
             )
 
         if self.window_resizable and not self._auto_layout_resize:
-            self.window_size = max(
-                self.width(),
-                self.height(),
-            )
-
-            # Defer the companion resize until Qt has completed the native
-            # edge/corner resize event. This keeps side and bottom/top edges
-            # responsive instead of fighting the window manager mid-drag.
-            QTimer.singleShot(
-                0,
-                lambda w=width_changed, h=height_changed:
-                    self.ensure_layout_content_size(w, h),
-            )
+            # Preserve the user's independent width and height choices.
+            self.window_size = max(self.width(), self.height())
 
         super().resizeEvent(event)
+
+        if self.window_resizable and not self._auto_layout_resize:
+            QTimer.singleShot(
+                150,
+                lambda: self.save_preferences(
+                    self.window_size,
+                    self.window_resizable,
+                ),
+            )
 
         QTimer.singleShot(
             0,
@@ -9139,6 +9062,17 @@ class MidiRandomizeWindow(QMainWindow):
         self.apply_resize_mode()
 
     def open_preferences(self):
+        """Open one modeless Preferences window and keep settings synchronized."""
+        existing = getattr(self, "_preferences_dialog", None)
+        if existing is not None:
+            try:
+                if existing.isVisible():
+                    existing.raise_()
+                    existing.activateWindow()
+                    return
+            except RuntimeError:
+                self._preferences_dialog = None
+
         dialog = PreferencesDialog(
             self.backend,
             self.window_size,
@@ -9176,32 +9110,32 @@ class MidiRandomizeWindow(QMainWindow):
             self.debug_panel_rows,
             self,
         )
-
         self._preferences_dialog = dialog
+        dialog.finished.connect(
+            lambda result, current_dialog=dialog:
+                self._finish_preferences_dialog(current_dialog, result)
+        )
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
+    def _finish_preferences_dialog(self, dialog, result):
+        """Apply accepted Preferences values and release the modeless dialog."""
         try:
-            result = dialog.exec()
-        finally:
-            self._preferences_dialog = None
+            if result != QDialog.DialogCode.Accepted:
+                return
 
-        if result != QDialog.DialogCode.Accepted:
-            return
+            size = dialog.selected_size
+            resizable = dialog.selected_resizable
 
-        size = dialog.selected_size
-        resizable = dialog.selected_resizable
+            if size is None:
+                return
 
-        if size is not None:
             self.window_resizable = bool(resizable)
-            self.set_layout_mode(
-                dialog.selected_layout
-            )
+            self.set_layout_mode(dialog.selected_layout)
             self.set_window_size(size)
-            self.set_window_width(
-                dialog.selected_window_width
-            )
-            self.set_background_color(
-                dialog.selected_background_color
-            )
+            self.set_window_width(dialog.selected_window_width)
+            self.set_background_color(dialog.selected_background_color)
             self.set_button_color(
                 "button_background_color",
                 dialog.selected_button_background_color,
@@ -9226,9 +9160,7 @@ class MidiRandomizeWindow(QMainWindow):
                 "pot_caption_text_color",
                 dialog.selected_pot_caption_text_color,
             )
-            self.set_range_text_color(
-                dialog.selected_range_text_color,
-            )
+            self.set_range_text_color(dialog.selected_range_text_color)
             self.set_graph_color(
                 "graph_background_color",
                 dialog.selected_graph_background_color,
@@ -9252,21 +9184,19 @@ class MidiRandomizeWindow(QMainWindow):
             self.set_reset_graph_on_left_click(
                 dialog.selected_reset_graph_on_left_click
             )
-            self.set_debug_to_terminal(
-                dialog.selected_debug_to_terminal
-            )
-            self.set_graph_beats(
-                dialog.selected_graph_beats
-            )
+            self.set_debug_to_terminal(dialog.selected_debug_to_terminal)
+            self.set_graph_beats(dialog.selected_graph_beats)
+
             if dialog.selected_frameless_window != self._frameless:
                 self.toggle_frameless_window(
                     dialog.selected_frameless_window
                 )
             else:
-                self.save_preferences(
-                    size,
-                    self.window_resizable,
-                )
+                self.save_preferences(size, self.window_resizable)
+        finally:
+            if getattr(self, "_preferences_dialog", None) is dialog:
+                self._preferences_dialog = None
+            dialog.deleteLater()
 
     def reset_all_preferences(self):
         """Restore every persisted application preference to its default."""
@@ -9326,12 +9256,6 @@ class MidiRandomizeWindow(QMainWindow):
 
         self.window_size = DEFAULT_SIZE
         self.window_width = DEFAULT_WINDOW_WIDTH
-
-        # Restore the recommended MIDI activity filter.
-        if hasattr(self.backend, "recommended_activity_filter"):
-            self.backend.activity_filter = dict(
-                self.backend.recommended_activity_filter
-            )
 
         if hasattr(self.backend, "set_debug_to_terminal"):
             self.backend.set_debug_to_terminal(False)
@@ -9428,8 +9352,6 @@ class MidiRandomizeWindow(QMainWindow):
             "  The timestamp-free event body is the intended RaySession "
             "integration format:\n"
             "  CH 8  A0  PAN 64 → 91\n\n"
-            "Preferences / MIDI Filter:\n"
-            "  Select which MIDI message types pass through the filter.\n\n"
             "Preferences / Randomizer Behavior:\n"
             "  Configure the PAN randomization range, distribution, Bias, "
             "Max. Change, duplicate/recent-value behavior and timing controls.\n\n"
